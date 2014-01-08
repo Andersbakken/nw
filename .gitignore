@@ -7,3 +7,5 @@
 /cmake_install.cmake
 /nw
 /rules.ninja
+/.gdb_brestore
+/.gdb_brestore.txt
