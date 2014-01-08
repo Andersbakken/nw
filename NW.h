@@ -52,12 +52,12 @@ public:
             return std::string(buf, w);
         }
     };
-    void setInterface(const Interface &interface)
-    {
-        setInterfaces(std::vector<Interface>(1, interface));
-    }
     void setInterfaces(const std::vector<Interface> &interfaces);
+    void setInterface(const Interface &interface) { setInterfaces(std::vector<Interface>(1, interface)); }
     std::vector<Interface> interfaces() const;
+
+    int maxContentLength() const;
+    void setMaxContentLength(int maxContentLength);
 
     enum Error {
         Success,
@@ -74,7 +74,8 @@ public:
         Interface remoteInterface() const { return mRemoteInterface; }
         const std::vector<std::pair<std::string, std::string> > &headers() const { return mHeaders; }
         std::string path() const { return mPath; }
-
+        bool hasHeader(const std::string &header) const;
+        std::string headerValue(const std::string &header) const;
         enum Method {
             NoMethod,
             Get,
@@ -103,7 +104,7 @@ public:
 
         Connection connection() const { return mConnection; }
         int contentLength() const { return mContentLength; }
-        int read(char *buf, int max);
+        int readContent(char *buf, int max);
     private:
         Request(int socket, const Interface &local, const Interface &remote);
         ~Request();
@@ -116,19 +117,21 @@ public:
         std::string mPath;
 
         std::vector<std::pair<std::string, std::string> > mHeaders;
-        char *mBuffer;
-        int mBufferLength, mBufferCapacity;
         enum {
-            ParseRequest,
+            ParseRequestLine,
             ParseHeaders,
             ParseBody,
-            ParseError
+            RequestError,
         } mState;
         int mContentLength;
+
+        char *mBuffer;
+        int mBufferLength, mBufferCapacity;
+
         friend class NW;
     };
 
-    virtual void handleConnection(Request *conn) = 0;
+    virtual void handleRequest(Request *conn) = 0;
     enum LogType {
         Log_Debug,
         Log_Info,
@@ -147,14 +150,8 @@ private:
     void error(const char *format, ...);
 #endif
     void parseHeaders(Request *conn, const char *buf, int len);
-
-    enum Mode {
-        Read = 0x1,
-        Write = 0x2
-    };
-
     Request *acceptConnection(int fd, const Interface &localInterface);
-    bool processConnection(Request *connection);
+    bool processRequest(Request *connection);
     void wakeup(char byte);
 
     bool mRunning;
@@ -163,6 +160,7 @@ private:
     int mPipe[2];
     bool mInterfacesDirty;
     std::vector<Interface> mInterfaces;
+    int mMaxContentLength;
 };
 
 #endif

@@ -46,7 +46,7 @@ struct LockScope
 };
 
 NW::NW()
-    : mRunning(false), mInterfacesDirty(false)
+    : mRunning(false), mInterfacesDirty(false), mMaxContentLength(INT_MAX)
 {
     signal(SIGPIPE, SIG_IGN);
     REQUIRE(pthread_mutex_init(&mMutex, 0));
@@ -61,6 +61,12 @@ NW::~NW()
     REQUIRE(pthread_mutex_destroy(&mMutex));
 }
 
+std::vector<NW::Interface> NW::interfaces() const
+{
+    LockScope scope(mMutex);
+    return mInterfaces;
+}
+
 void NW::setInterfaces(const std::vector<Interface> &interfaces)
 {
     {
@@ -70,6 +76,18 @@ void NW::setInterfaces(const std::vector<Interface> &interfaces)
         if (mRunning)
             wakeup('i');
     }
+}
+
+int NW::maxContentLength() const
+{
+    LockScope scope(mMutex);
+    return mMaxContentLength;
+}
+
+void NW::setMaxContentLength(int maxContentLength)
+{
+    LockScope scope(mMutex);
+    mMaxContentLength = maxContentLength;
 }
 
 void NW::stop()
@@ -89,43 +107,6 @@ void NW::stop()
         void *retval;
         pthread_join(mThread, &retval);
     }
-}
-
-int NW::Request::read(char *buf, int max)
-{
-    assert(buf); // ### should one be able to discard data?
-    assert(max > 0);
-    if (mBufferLength) {
-        const int s = std::min(max, mBufferLength);
-        ::memcpy(buf, mBuffer, s);
-        buf += s;
-        if (s == mBufferLength) {
-            ::free(mBuffer);
-            mBufferLength = 0;
-            mBuffer = 0;
-        } else {
-            ::memmove(mBuffer + max, mBuffer, mBufferLength - max);
-            mBufferLength -= max;
-        }
-        max -= s;
-    }
-    int ret = 0;
-    if (max) {
-        EINTRWRAP(ret, ::read(mSocket, buf, max));
-    }
-    return ret;
-}
-
-NW::Request::Request(int socket, const NW::Interface &local, const NW::Interface &remote)
-    : mSocket(socket), mLocalInterface(local), mRemoteInterface(remote),
-      mBuffer(0), mBufferLength(0), mBufferCapacity(0), mState(ParseRequest),
-      mMethod(NoMethod), mVersion(NoVersion), mConnection(NoConnection), mContentLength(-1)
-{}
-
-NW::Request::~Request()
-{
-    if (mBuffer)
-        ::free(mBuffer);
 }
 
 NW::Error NW::exec()
@@ -158,7 +139,6 @@ NW::Error NW::exec()
                     ::close(it->first);
                     sockets.erase(it++);
                 }
-                int idx = 0;
                 for (std::vector<Interface>::const_iterator it = mInterfaces.begin(); it != mInterfaces.end(); ++it) {
                     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
                     if (fd < 0) {
@@ -205,24 +185,21 @@ NW::Error NW::exec()
                     break;
             }
         }
-        fd_set r, w;
+        fd_set r;
         FD_ZERO(&r);
-        FD_ZERO(&w);
         FD_SET(mPipe[0], &r);
         int max = mPipe[0];
         for (std::map<int, Interface>::const_iterator it = sockets.begin(); it != sockets.end(); ++it) {
             FD_SET(it->first, &r);
-            FD_SET(it->first, &w);
             max = std::max(max, it->first);
         }
         for (std::set<Request*>::const_iterator it = requests.begin(); it != requests.end(); ++it) {
             const int fd = (*it)->socket();
             FD_SET(fd, &r);
-            FD_SET(fd, &w);
             max = std::max(max, fd);
         }
         int count = 0;
-        EINTRWRAP(count, ::select(max + 1, &r, &w, 0, 0));
+        EINTRWRAP(count, ::select(max + 1, &r, 0, 0, 0));
         assert(count > 0);
         char pipe = 0;
         if (FD_ISSET(mPipe[0], &r)) {
@@ -232,24 +209,18 @@ NW::Error NW::exec()
         }
         debug("Select: %d %c\n", count, pipe ? pipe : ' ');
         for (std::map<int, Interface>::const_iterator it = sockets.begin(); count && it != sockets.end(); ++it) {
-            // uint8_t mode = 0;
-            // if (FD_ISSET(it->first, &r)) {
-            //     mode |= Read;
-            // } else if (FD_ISSET(it->first, &w)) {
-            //     mode |= Write;
-            // }
             if (FD_ISSET(it->first, &r)) {
                 --count;
-                Request *conn = acceptConnection(it->first, it->second);
-                if (conn) {
-                    requests.insert(conn);
+                Request *req = acceptConnection(it->first, it->second);
+                if (req) {
+                    requests.insert(req);
                 }
             }
         }
         std::set<Request*>::iterator it = requests.begin();
         while (count && it != requests.end()) {
             if (FD_ISSET((*it)->socket(), &r)) {
-                if (!processConnection(*it)) {
+                if (!processRequest(*it)) {
                     int ret;
                     EINTRWRAP(ret, ::close((*it)->socket()));
                     requests.erase(it++);
@@ -280,12 +251,6 @@ void NW::wakeup(char byte)
     EINTRWRAP(ret, write(mPipe[1], &byte, sizeof(byte)));
     assert(ret == 1);
     (void)ret;
-}
-
-std::vector<NW::Interface> NW::interfaces() const
-{
-    LockScope scope(mMutex);
-    return mInterfaces;
 }
 
 enum Food {
@@ -375,102 +340,131 @@ static inline const char *strnchr(const char *haystack, char needle, int max)
     return 0;
 }
 
-bool NW::processConnection(Request *connection)
+static std::string trim(const char *start, int len)
 {
-    assert(connection);
-    switch (connection->mState) {
-    case Request::ParseRequest:
+    while (len && isspace(static_cast<unsigned char>(*start))) {
+        --len;
+        ++start;
+    }
+
+    while (len && isspace(static_cast<unsigned char>(*start + len - 1))) {
+        --len;
+    }
+
+    return std::string(start, len);
+}
+
+bool NW::processRequest(Request *request)
+{
+    assert(request);
+    enum { ChunkSize = 1025 };
+    if (request->mBufferCapacity - request->mBufferLength < ChunkSize) {
+        request->mBufferCapacity = ChunkSize - (request->mBufferCapacity - request->mBufferLength);
+        request->mBuffer = static_cast<char*>(::realloc(request->mBuffer, request->mBufferCapacity));
+    }
+    int read;
+    EINTRWRAP(read, ::read(request->socket(), request->mBuffer + request->mBufferLength, ChunkSize - 1));
+    if (!read) {
+        return false; // socket was closed
+    }
+    request->mBufferLength += read;
+    request->mBuffer[request->mBufferLength] = '\0';
+    
+    switch (request->mState) {
+    case Request::ParseRequestLine:
     case Request::ParseHeaders: {
-        enum { ChunkSize = 1024 };
-        if (connection->mBufferCapacity - connection->mBufferLength < ChunkSize) {
-            connection->mBufferCapacity = ChunkSize - (connection->mBufferCapacity - connection->mBufferLength);
-            connection->mBuffer = static_cast<char*>(::realloc(connection->mBuffer, connection->mBufferCapacity));
-        }
-        int read;
-        EINTRWRAP(read, ::read(connection->socket(), connection->mBuffer + connection->mBufferLength, ChunkSize - 1));
-        if (read > 0) {
-            connection->mBufferLength += read;
-            connection->mBuffer[connection->mBufferLength] = '\0';
-            char *buf = connection->mBuffer;
-            while (connection->mState != Request::ParseBody) {
-                char *crlf = strstr(buf, "\r\n");
-                if (crlf) {
-                    *crlf = '\0';
+        char *buf = request->mBuffer;
+        while (request->mState != Request::ParseBody) {
+            char *crlf = strstr(buf, "\r\n");
+            if (crlf) {
+                *crlf = '\0';
+            } else {
+                break;
+            }
+            switch (request->mState) {
+            case Request::ParseRequestLine:
+                if (!::parseRequestLine(request->mBuffer, request->mMethod, request->mVersion, request->mPath)) {
+                    error("Parse error when parsing requestLine: [%s]\n",
+                          std::string(buf, crlf - buf).c_str());
+                    request->mState = Request::RequestError;
+                    return false;
                 } else {
-                    break;
+                    request->mState = Request::ParseHeaders;
+                    printf("Got Method %s => %d [%s]\n", std::string(buf, crlf - buf).c_str(), request->mMethod,
+                           request->mPath.c_str());
+                    buf = crlf + 2;
                 }
-                switch (connection->mState) {
-                case Request::ParseRequest:
-                    if (!::parseRequestLine(connection->mBuffer, connection->mMethod, connection->mVersion, connection->mPath)) {
-                        error("Parse error when parsing requestLine: [%s]\n",
-                              std::string(buf, crlf - buf).c_str());
-                        connection->mState = Request::ParseError;
-                        return false;
-                    } else {
-                        connection->mState = Request::ParseHeaders;
-                        printf("Got Method %s => %d [%s]\n", std::string(buf, crlf - buf).c_str(), connection->mMethod,
-                               connection->mPath.c_str());
-                        buf = crlf + 2;
-                    }
-                    break;
-                case Request::ParseHeaders:
-                    printf("Got header: [%s]\n", std::string(buf, crlf - buf).c_str());
-                    if (crlf == buf) {
-                        connection->mState = Request::ParseBody;
-                    } else {
-                        const char *colon = strnchr(buf, ':', crlf - buf);
-                        connection->mHeaders.push_back(std::pair<std::string, std::string>());
-                        std::pair<std::string, std::string> &h = connection->mHeaders.back();
-                        if (colon) {
-                            if (colon == buf) {
-                                error("Parse error when parsing header: [%s]\n",
+                break;
+            case Request::ParseHeaders:
+                if (crlf == buf) {
+                    request->mState = Request::ParseBody;
+                } else {
+                    const char *colon = strnchr(buf, ':', crlf - buf);
+                    request->mHeaders.push_back(std::pair<std::string, std::string>());
+                    std::pair<std::string, std::string> &h = request->mHeaders.back();
+                    if (colon) {
+                        if (colon == buf) {
+                            error("Parse error when parsing header: [%s]\n",
+                                  std::string(buf, crlf - buf).c_str());
+                            request->mState = Request::RequestError;
+                            return false;
+                        }
+                        // ### need to chomp spaces
+                        h.first = trim(buf, colon - buf);
+                        if (!strcasecmp(h.first.c_str(), "Content-Length")) {
+                            char *end;
+                            unsigned long contentLength = strtoull(h.second.c_str(), &end, 10);
+                            if (*end) {
+                                error("Parse error when parsing Content-Length: [%s]\n",
                                       std::string(buf, crlf - buf).c_str());
-                                connection->mState = Request::ParseError;
+                                request->mState = Request::RequestError;
                                 return false;
                             }
-                            // ### need to chomp spaces
-                            h.first.assign(buf, colon - buf);
-                            if (!strcasecmp(h.first.c_str(), "Content-Length")) {
-                                char *end;
-                                unsigned long contentLength = strtoull(h.second.c_str(), &end, 10);
-                                if (*end) {
-                                    error("Parse error when parsing Content-Length: [%s]\n",
-                                          std::string(buf, crlf - buf).c_str());
-                                    connection->mState = Request::ParseError;
-                                    return false;
-                                }
 
-                                connection->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
-                            }
-                            ++colon;
-                            eat(colon, Space);
-                            if (colon < crlf)
-                                h.second.assign(colon, crlf - colon);
-                        } else {
-                            printf("%p %p %p %d\n", buf, crlf, colon, crlf - colon);
-                            h.first.assign(buf, crlf - colon);
+                            request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
                         }
-                        printf("[%s] [%s]\n", h.first.c_str(), h.second.c_str());
-                        buf = crlf + 2;
+                        ++colon;
+                        eat(colon, Space);
+                        if (colon < crlf)
+                            h.second = trim(colon, crlf - colon);
+                    } else {
+                        h.first = trim(buf, crlf - colon);
                     }
-                    break;
-                case Request::ParseBody:
-                case Request::ParseError:
-                    assert(0);
-                    break;
+                    debug("Header: %s: %s\n", h.first.c_str(), h.second.c_str());
+                    buf = crlf + 2;
                 }
+                break;
+            case Request::ParseBody:
+            case Request::RequestError:
+                assert(0);
+                break;
             }
-
         }
         break; }
     case Request::ParseBody:
+        if (request->mContentLength == -1) {
+            std::string val = request->headerValue("Content-Length");
+            char *end = 0;
+            const unsigned long contentLength = strtoull(val.c_str(), &end, 10);
+            if (*end) {
+                error("Parse error when parsing Content-Length: [%s]\n", val.c_str());
+                request->mState = Request::RequestError;
+                return false;
+            }
+
+            request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
+        }
+        if (request->mContentLength > maxContentLength()) {
+            error("Request exceeds maximum content length %d/%d", request->mContentLength, maxContentLength());
+            request->mState = Request::RequestError;
+            return false;
+        }
+        // handleRequest(request);
         break;
-    case Request::ParseError:
+    case Request::RequestError:
         assert(0);
         break;
     }
-    if (connection->mState == Request::ParseBody)
-        handleConnection(connection);
 }
 
 NW::Request *NW::acceptConnection(int fd, const Interface &localInterface)
@@ -550,20 +544,66 @@ void NW::error(const char *format, ...)
     va_end(v);
 }
 
-// bool NW::parseHeaders(Connection *conn)
-// {
-//     assert(!mReadHeaders);
+// ==================== Request ====================
 
-//     char buf[1024];
-//     int read;
-//     while (true) {
-//         EINTRWRAP(read, ::read(conn->socket(), buf, sizeof(buf)));
-//         // if (read > 0) {
-//         //     parseHeaders(connection, buf, read);
-//         // } else {
-//         //     break;
-//         // }
-//     }
+NW::Request::Request(int socket, const NW::Interface &local, const NW::Interface &remote)
+    : mSocket(socket), mLocalInterface(local), mRemoteInterface(remote),
+      mMethod(NoMethod), mVersion(NoVersion), mConnection(NoConnection),
+      mState(ParseRequestLine), mContentLength(-1), mBuffer(0), mBufferLength(0),
+      mBufferCapacity(0)
+{}
 
-//     printf("READ:\n%s\n", std::string(buf, len).c_str());
-// }
+NW::Request::~Request()
+{
+    if (mBuffer)
+        ::free(mBuffer);
+}
+
+
+bool NW::Request::hasHeader(const std::string &header) const
+{
+    const size_t len = header.size();
+    for (std::vector<std::pair<std::string, std::string> >::const_iterator it = mHeaders.begin(); it != mHeaders.end(); ++it) {
+        if (it->first.size() == len && strcasecmp(header.c_str(), it->first.c_str())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string NW::Request::headerValue(const std::string &header) const
+{
+    const size_t len = header.size();
+    for (std::vector<std::pair<std::string, std::string> >::const_iterator it = mHeaders.begin(); it != mHeaders.end(); ++it) {
+        if (it->first.size() == len && strcasecmp(header.c_str(), it->first.c_str())) {
+            return it->second;
+        }
+    }
+    return std::string();
+}
+
+int NW::Request::readContent(char *buf, int max)
+{
+    assert(buf); // ### should one be able to discard data?
+    assert(max > 0);
+    if (mBufferLength) {
+        const int s = std::min(max, mBufferLength);
+        ::memcpy(buf, mBuffer, s);
+        buf += s;
+        if (s == mBufferLength) {
+            ::free(mBuffer);
+            mBufferLength = 0;
+            mBuffer = 0;
+        } else {
+            ::memmove(mBuffer + max, mBuffer, mBufferLength - max);
+            mBufferLength -= max;
+        }
+        max -= s;
+    }
+    int ret = 0;
+    if (max) {
+        EINTRWRAP(ret, ::read(mSocket, buf, max));
+    }
+    return ret;
+}
+

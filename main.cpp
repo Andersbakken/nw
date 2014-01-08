@@ -6,7 +6,7 @@ public:
     Server()
     {}
 
-    virtual void handleConnection(Request *conn)
+    virtual void handleRequest(Request *conn)
     {
 
 
