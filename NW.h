@@ -21,6 +21,13 @@ public:
         static IP localhost() { return IP(127, 0, 0, 1); }
         static IP any() { return IP(); }
 
+        std::string toString() const
+        {
+            char buf[16];
+            int w = snprintf(buf, sizeof(buf), "%d.%d.%d.%d", a, b, c, d);
+            return std::string(buf, w);
+        }
+
         bool operator==(const IP &o) const { return (a == o.a && b == o.b && c == o.c && d == o.d); }
         bool operator!=(const IP &o) const { return (a != o.a || b != o.b || c != o.c || d != o.d); }
 
@@ -30,11 +37,19 @@ public:
     struct Interface
     {
         Interface()
-            : ip(IP::any()), port(0), backlog(128)
+            : ip(IP::any()), port(0)
         {}
 
         IP ip;
-        uint16_t port, backlog;
+        uint16_t port;
+
+        std::string toString() const
+        {
+            std::string ret = ip.toString();
+            char buf[32];
+            const int w = snprintf(buf, sizeof(buf), "%s:%d", ip.toString().c_str(), port);
+            return std::string(buf, w);
+        }
     };
     void setInterface(const Interface &interface)
     {
@@ -56,9 +71,22 @@ public:
         int socket() const { return mSocket; }
         Interface localInterface() const { return mLocalInterface; }
         Interface remoteInterface() const { return mRemoteInterface; }
-        const std::vector<std::string> &headers() const { return mHeaders; }
+        const std::vector<std::pair<std::string, std::string> > &headers() const { return mHeaders; }
+        std::string path() const { return mPath; }
 
-        int contentLength() const;
+        enum Method {
+            Invalid,
+            Get,
+            Head,
+            Post,
+            Put,
+            Delete,
+            Trace,
+            Connect
+        };
+        Method method() const { return mMethod; }
+
+        int contentLength() const { return mContentLength; }
         int read(char *buf, int max);
     private:
         Connection(int socket, const Interface &local, const Interface &remote);
@@ -66,26 +94,46 @@ public:
 
         int mSocket;
         Interface mLocalInterface, mRemoteInterface;
+        Method mMethod;
+        std::string mPath;
 
-        std::vector<std::string> mHeaders;
+        std::vector<std::pair<std::string, std::string> > mHeaders;
         char *mBuffer;
-        int mBufferLength;
+        int mBufferLength, mBufferCapacity;
+        enum {
+            ParseMethod,
+            ParseHeaders,
+            ParseBody,
+            ParseError
+
+        } mState;
+        int mContentLength;
         friend class NW;
     };
 
     virtual void handleConnection(Connection *conn) = 0;
     enum LogType {
-        Debug,
-        Error
+        Log_Debug,
+        Log_Error
     };
     virtual void log(LogType, const char *) {}
 private:
+    void log(LogType level, const char *format, va_list v);
+#ifdef __GNUC__
+    void debug(const char *format, ...) __attribute__ ((format (printf, 2, 3)));
+    void error(const char *format, ...) __attribute__ ((format (printf, 2, 3)));
+#else
+    void debug(const char *format, ...);
+    void error(const char *format, ...);
+#endif
+    void parseHeaders(Connection *conn, const char *buf, int len);
+
     enum Mode {
         Read = 0x1,
         Write = 0x2
     };
 
-    void acceptConnection(int fd, const Interface &localInterface);
+    Connection *acceptConnection(int fd, const Interface &localInterface);
     void processConnection(Connection *connection);
     void wakeup(char byte);
 

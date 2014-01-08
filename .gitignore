@@ -1,0 +1,9 @@
+/CMakeCache.txt
+/.gdb_history
+/.ninja_deps
+/.ninja_log
+/CMakeFiles/*
+/build.ninja
+/cmake_install.cmake
+/nw
+/rules.ninja

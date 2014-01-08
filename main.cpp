@@ -11,6 +11,10 @@ public:
 
 
     }
+    virtual void log(LogType level, const char *string)
+    {
+        printf("%d: %s", level, string);
+    }
 };
 
 
