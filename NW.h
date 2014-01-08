@@ -5,6 +5,7 @@
 #include <string>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 
 class NW
 {
@@ -65,7 +66,7 @@ public:
     Error exec();
     void stop();
 
-    class Connection
+    class Request
     {
     public:
         int socket() const { return mSocket; }
@@ -75,7 +76,7 @@ public:
         std::string path() const { return mPath; }
 
         enum Method {
-            Invalid,
+            NoMethod,
             Get,
             Head,
             Post,
@@ -86,55 +87,74 @@ public:
         };
         Method method() const { return mMethod; }
 
+        enum Version {
+            NoVersion,
+            V1_0,
+            V1_1
+        };
+
+        Version version() const { return mVersion; }
+
+        enum Connection {
+            NoConnection,
+            KeepAlive,
+            Close
+        };
+
+        Connection connection() const { return mConnection; }
         int contentLength() const { return mContentLength; }
         int read(char *buf, int max);
     private:
-        Connection(int socket, const Interface &local, const Interface &remote);
-        ~Connection();
+        Request(int socket, const Interface &local, const Interface &remote);
+        ~Request();
 
         int mSocket;
         Interface mLocalInterface, mRemoteInterface;
         Method mMethod;
+        Version mVersion;
+        Connection mConnection;
         std::string mPath;
 
         std::vector<std::pair<std::string, std::string> > mHeaders;
         char *mBuffer;
         int mBufferLength, mBufferCapacity;
         enum {
-            ParseMethod,
+            ParseRequest,
             ParseHeaders,
             ParseBody,
             ParseError
-
         } mState;
         int mContentLength;
         friend class NW;
     };
 
-    virtual void handleConnection(Connection *conn) = 0;
+    virtual void handleConnection(Request *conn) = 0;
     enum LogType {
         Log_Debug,
+        Log_Info,
         Log_Error
     };
     virtual void log(LogType, const char *) {}
 private:
     void log(LogType level, const char *format, va_list v);
 #ifdef __GNUC__
+    void info(const char *format, ...) __attribute__ ((format (printf, 2, 3)));
     void debug(const char *format, ...) __attribute__ ((format (printf, 2, 3)));
     void error(const char *format, ...) __attribute__ ((format (printf, 2, 3)));
 #else
+    void info(const char *format, ...);
     void debug(const char *format, ...);
     void error(const char *format, ...);
 #endif
-    void parseHeaders(Connection *conn, const char *buf, int len);
+    void parseHeaders(Request *conn, const char *buf, int len);
 
     enum Mode {
         Read = 0x1,
         Write = 0x2
     };
 
-    Connection *acceptConnection(int fd, const Interface &localInterface);
-    void processConnection(Connection *connection);
+    Request *acceptConnection(int fd, const Interface &localInterface);
+    bool processConnection(Request *connection);
     void wakeup(char byte);
 
     bool mRunning;

@@ -12,11 +12,13 @@
 #include <unistd.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <stdarg.h>
+#include <limits.h>
 
 #ifdef NDEBUG
-#define CHECK(op) op
+#define REQUIRE(op) op
 #else
-#define CHECK(op)                               \
+#define REQUIRE(op)                             \
     do {                                        \
         const int retVal = op;                  \
         assert(!retVal);                        \
@@ -33,11 +35,11 @@ struct LockScope
     LockScope(pthread_mutex_t &mutex)
         : mMutex(mutex)
     {
-        CHECK(pthread_mutex_lock(&mMutex));
+        REQUIRE(pthread_mutex_lock(&mMutex));
     }
     ~LockScope()
     {
-        CHECK(pthread_mutex_unlock(&mMutex));
+        REQUIRE(pthread_mutex_unlock(&mMutex));
     }
 
     pthread_mutex_t mMutex;
@@ -47,8 +49,8 @@ NW::NW()
     : mRunning(false), mInterfacesDirty(false)
 {
     signal(SIGPIPE, SIG_IGN);
-    CHECK(pthread_mutex_init(&mMutex, 0));
-    CHECK(pipe(mPipe));
+    REQUIRE(pthread_mutex_init(&mMutex, 0));
+    REQUIRE(pipe(mPipe));
 }
 
 NW::~NW()
@@ -56,7 +58,7 @@ NW::~NW()
     stop();
     close(mPipe[0]);
     close(mPipe[1]);
-    CHECK(pthread_mutex_destroy(&mMutex));
+    REQUIRE(pthread_mutex_destroy(&mMutex));
 }
 
 void NW::setInterfaces(const std::vector<Interface> &interfaces)
@@ -89,7 +91,7 @@ void NW::stop()
     }
 }
 
-int NW::Connection::read(char *buf, int max)
+int NW::Request::read(char *buf, int max)
 {
     assert(buf); // ### should one be able to discard data?
     assert(max > 0);
@@ -114,12 +116,13 @@ int NW::Connection::read(char *buf, int max)
     return ret;
 }
 
-NW::Connection::Connection(int socket, const NW::Interface &local, const NW::Interface &remote)
+NW::Request::Request(int socket, const NW::Interface &local, const NW::Interface &remote)
     : mSocket(socket), mLocalInterface(local), mRemoteInterface(remote),
-      mBuffer(0), mBufferLength(0), mBufferCapacity(0), mState(ParseMethod), mContentLength(-1)
+      mBuffer(0), mBufferLength(0), mBufferCapacity(0), mState(ParseRequest),
+      mMethod(NoMethod), mVersion(NoVersion), mConnection(NoConnection), mContentLength(-1)
 {}
 
-NW::Connection::~Connection()
+NW::Request::~Request()
 {
     if (mBuffer)
         ::free(mBuffer);
@@ -136,7 +139,7 @@ NW::Error NW::exec()
 
     NW::Error retVal = Success;
 
-    std::set<Connection*> connections;
+    std::set<Request*> requests;
     std::map<int, Interface> sockets;
     while (true) {
         {
@@ -196,6 +199,7 @@ NW::Error NW::exec()
                         break;
                     }
                     sockets[fd] = *it;
+                    info("Listening on %s\n", it->toString().c_str());
                 }
                 if (retVal)
                     break;
@@ -211,7 +215,7 @@ NW::Error NW::exec()
             FD_SET(it->first, &w);
             max = std::max(max, it->first);
         }
-        for (std::set<Connection*>::const_iterator it = connections.begin(); it != connections.end(); ++it) {
+        for (std::set<Request*>::const_iterator it = requests.begin(); it != requests.end(); ++it) {
             const int fd = (*it)->socket();
             FD_SET(fd, &r);
             FD_SET(fd, &w);
@@ -226,7 +230,7 @@ NW::Error NW::exec()
             EINTRWRAP(written, ::read(mPipe[0], &pipe, sizeof(pipe)));
             --count;
         }
-        printf("%d %c\n", count, pipe ? pipe : ' ');
+        debug("Select: %d %c\n", count, pipe ? pipe : ' ');
         for (std::map<int, Interface>::const_iterator it = sockets.begin(); count && it != sockets.end(); ++it) {
             // uint8_t mode = 0;
             // if (FD_ISSET(it->first, &r)) {
@@ -236,16 +240,25 @@ NW::Error NW::exec()
             // }
             if (FD_ISSET(it->first, &r)) {
                 --count;
-                Connection *conn = acceptConnection(it->first, it->second);
+                Request *conn = acceptConnection(it->first, it->second);
                 if (conn) {
-                    connections.insert(conn);
+                    requests.insert(conn);
                 }
             }
         }
-        for (std::set<Connection*>::const_iterator it = connections.begin(); count && it != connections.end(); ++it) {
+        std::set<Request*>::iterator it = requests.begin();
+        while (count && it != requests.end()) {
             if (FD_ISSET((*it)->socket(), &r)) {
-                processConnection(*it);
+                if (!processConnection(*it)) {
+                    int ret;
+                    EINTRWRAP(ret, ::close((*it)->socket()));
+                    requests.erase(it++);
+                } else {
+                    ++it;
+                }
                 --count;
+            } else {
+                ++it;
             }
         }
 
@@ -253,7 +266,7 @@ NW::Error NW::exec()
     for (std::map<int, Interface>::const_iterator it = sockets.begin(); it != sockets.end(); ++it) {
         ::close(it->first);
     }
-    for (std::set<Connection*>::const_iterator it = connections.begin(); it != connections.end(); ++it) {
+    for (std::set<Request*>::const_iterator it = requests.begin(); it != requests.end(); ++it) {
         ::close((*it)->socket());
         delete *it;
     }
@@ -282,50 +295,69 @@ enum Food {
 static inline bool eat(const char *&ch, Food food)
 {
     while (*ch) {
-        if (isspace(static_cast<unsigned char>(*ch)) != (food == Space))
+        const bool space = isspace(static_cast<unsigned char>(*ch));
+        if (space != (food == Space))
             return true;
         ++ch;
     }
     return false;
 }
 
-static inline bool parseRequestLine(const char *str, NW::Connection::Method &method, std::string &path)
+static inline bool parseRequestLine(const char *str,
+                                    NW::Request::Method &method,
+                                    NW::Request::Version &version,
+                                    std::string &path)
 {
+    version = NW::Request::NoVersion;
+    method = NW::Request::NoMethod;
     if (!strncmp(str, "GET ", 4)) {
-        method = NW::Connection::Get;
+        method = NW::Request::Get;
         str += 4;
     } else if (!strncmp(str, "HEAD ", 5)) {
-        method = NW::Connection::Head;
+        method = NW::Request::Head;
         str += 5;
     } else if (!strncmp(str, "POST ", 5)) {
-        method = NW::Connection::Post;
+        method = NW::Request::Post;
         str += 5;
     } else if (!strncmp(str, "PUT ", 4)) {
-        method = NW::Connection::Put;
+        method = NW::Request::Put;
         str += 4;
     } else if (!strncmp(str, "Delete ", 7)) {
-        method = NW::Connection::Delete;
+        method = NW::Request::Delete;
         str += 7;
     } else if (!strncmp(str, "Trace ", 6)) {
-        method = NW::Connection::Trace;
+        method = NW::Request::Trace;
         str += 6;
     } else if (!strncmp(str, "Connect ", 7)) {
-        method = NW::Connection::Connect;
+        method = NW::Request::Connect;
         str += 7;
     } else {
-        method = NW::Connection::Invalid;
         return false;
     }
-    if (!eat(str, Space))
+
+    if (!eat(str, Space)) {
         return false;
+    }
     const char *pathStart = str;
-    if (!eat(str, NonSpace))
+    if (!eat(str, NonSpace)) {
         return false;
+    }
     path.assign(pathStart, str - pathStart);
     eat(str, Space);
-    return !strncmp("HTTP/1.1\r\n", str, 10);
-
-    return true;
+    if (!strncmp("HTTP/1.", str, 7)) {
+        switch (str[7]) {
+        case '0':
+            version = NW::Request::V1_0;
+            break;
+        case '1':
+            version = NW::Request::V1_1;
+            break;
+        default:
+            return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 static inline const char *strnchr(const char *haystack, char needle, int max)
@@ -343,12 +375,12 @@ static inline const char *strnchr(const char *haystack, char needle, int max)
     return 0;
 }
 
-void NW::processConnection(Connection *connection)
+bool NW::processConnection(Request *connection)
 {
     assert(connection);
     switch (connection->mState) {
-    case Connection::ParseMethod:
-    case Connection::ParseHeaders: {
+    case Request::ParseRequest:
+    case Request::ParseHeaders: {
         enum { ChunkSize = 1024 };
         if (connection->mBufferCapacity - connection->mBufferLength < ChunkSize) {
             connection->mBufferCapacity = ChunkSize - (connection->mBufferCapacity - connection->mBufferLength);
@@ -360,26 +392,31 @@ void NW::processConnection(Connection *connection)
             connection->mBufferLength += read;
             connection->mBuffer[connection->mBufferLength] = '\0';
             char *buf = connection->mBuffer;
-            while (connection->mState != Connection::ParseBody) {
+            while (connection->mState != Request::ParseBody) {
                 char *crlf = strstr(buf, "\r\n");
+                if (crlf) {
+                    *crlf = '\0';
+                } else {
+                    break;
+                }
                 switch (connection->mState) {
-                case Connection::ParseMethod:
-                    if (!::parseRequestLine(connection->mBuffer, connection->mMethod, connection->mPath)) {
+                case Request::ParseRequest:
+                    if (!::parseRequestLine(connection->mBuffer, connection->mMethod, connection->mVersion, connection->mPath)) {
                         error("Parse error when parsing requestLine: [%s]\n",
                               std::string(buf, crlf - buf).c_str());
-                        connection->mState = Connection::ParseError;
-                        return;
+                        connection->mState = Request::ParseError;
+                        return false;
                     } else {
-                        connection->mState = Connection::ParseHeaders;
+                        connection->mState = Request::ParseHeaders;
                         printf("Got Method %s => %d [%s]\n", std::string(buf, crlf - buf).c_str(), connection->mMethod,
                                connection->mPath.c_str());
                         buf = crlf + 2;
                     }
                     break;
-                case Connection::ParseHeaders:
+                case Request::ParseHeaders:
                     printf("Got header: [%s]\n", std::string(buf, crlf - buf).c_str());
-                    if (crlf == buf + 2) {
-                        connection->mState = Connection::ParseBody;
+                    if (crlf == buf) {
+                        connection->mState = Request::ParseBody;
                     } else {
                         const char *colon = strnchr(buf, ':', crlf - buf);
                         connection->mHeaders.push_back(std::pair<std::string, std::string>());
@@ -388,8 +425,8 @@ void NW::processConnection(Connection *connection)
                             if (colon == buf) {
                                 error("Parse error when parsing header: [%s]\n",
                                       std::string(buf, crlf - buf).c_str());
-                                connection->mState = Connection::ParseError;
-                                return;
+                                connection->mState = Request::ParseError;
+                                return false;
                             }
                             // ### need to chomp spaces
                             h.first.assign(buf, colon - buf);
@@ -399,8 +436,8 @@ void NW::processConnection(Connection *connection)
                                 if (*end) {
                                     error("Parse error when parsing Content-Length: [%s]\n",
                                           std::string(buf, crlf - buf).c_str());
-                                    connection->mState = Connection::ParseError;
-                                    return;
+                                    connection->mState = Request::ParseError;
+                                    return false;
                                 }
 
                                 connection->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
@@ -410,14 +447,15 @@ void NW::processConnection(Connection *connection)
                             if (colon < crlf)
                                 h.second.assign(colon, crlf - colon);
                         } else {
+                            printf("%p %p %p %d\n", buf, crlf, colon, crlf - colon);
                             h.first.assign(buf, crlf - colon);
                         }
                         printf("[%s] [%s]\n", h.first.c_str(), h.second.c_str());
                         buf = crlf + 2;
                     }
                     break;
-                case Connection::ParseBody:
-                case Connection::ParseError:
+                case Request::ParseBody:
+                case Request::ParseError:
                     assert(0);
                     break;
                 }
@@ -425,20 +463,21 @@ void NW::processConnection(Connection *connection)
 
         }
         break; }
-    case Connection::ParseBody:
+    case Request::ParseBody:
         break;
-    case Connection::ParseError:
+    case Request::ParseError:
         assert(0);
         break;
     }
-    if (connection->mState == Connection::ParseBody)
+    if (connection->mState == Request::ParseBody)
         handleConnection(connection);
 }
 
-NW::Connection *NW::acceptConnection(int fd, const Interface &localInterface)
+NW::Request *NW::acceptConnection(int fd, const Interface &localInterface)
 {
     sockaddr address;
-    socklen_t len;
+    memset(&address, 0, sizeof(address));
+    socklen_t len = sizeof(sockaddr);
     int socket;
     EINTRWRAP(socket, ::accept(fd, &address, &len));
     if (socket < 0) {
@@ -460,7 +499,7 @@ NW::Connection *NW::acceptConnection(int fd, const Interface &localInterface)
     debug("::accepted connection on %s from %s (%d)",
           localInterface.toString().c_str(),
           remoteInterface.toString().c_str(), socket);
-    return new Connection(socket, localInterface, remoteInterface);
+    return new Request(socket, localInterface, remoteInterface);
 }
 
 void NW::log(LogType level, const char *format, va_list v)
@@ -491,7 +530,15 @@ void NW::debug(const char *format, ...)
 {
     va_list v;
     va_start(v, format);
-    log(Log_Error, format, v);
+    log(Log_Debug, format, v);
+    va_end(v);
+}
+
+void NW::info(const char *format, ...)
+{
+    va_list v;
+    va_start(v, format);
+    log(Log_Info, format, v);
     va_end(v);
 }
 

@@ -6,14 +6,15 @@ public:
     Server()
     {}
 
-    virtual void handleConnection(Connection *conn)
+    virtual void handleConnection(Request *conn)
     {
 
 
     }
     virtual void log(LogType level, const char *string)
     {
-        printf("%d: %s", level, string);
+        const char *names[] = { "Debug", "Info", "Error" };
+        printf("%s: %s", names[level], string);
     }
 };
 
