@@ -99,7 +99,8 @@ public:
         enum Connection {
             NoConnection,
             KeepAlive,
-            Close
+            Close,
+            Upgrade
         };
 
         Connection connection() const { return mConnection; }

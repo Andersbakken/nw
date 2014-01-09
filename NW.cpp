@@ -357,13 +357,18 @@ static std::string trim(const char *start, int len)
 bool NW::processRequest(Request *request)
 {
     assert(request);
-    enum { ChunkSize = 1025 };
-    if (request->mBufferCapacity - request->mBufferLength < ChunkSize) {
-        request->mBufferCapacity = ChunkSize - (request->mBufferCapacity - request->mBufferLength);
+    int needed;
+    if (request->mContentLength != -1) {
+        needed = request->mContentLength - request->mBufferLength;
+    } else {
+        needed = 1025;
+    }
+    if (request->mBufferCapacity - request->mBufferLength < needed) {
+        request->mBufferCapacity = needed - (request->mBufferCapacity - request->mBufferLength);
         request->mBuffer = static_cast<char*>(::realloc(request->mBuffer, request->mBufferCapacity));
     }
     int read;
-    EINTRWRAP(read, ::read(request->socket(), request->mBuffer + request->mBufferLength, ChunkSize - 1));
+    EINTRWRAP(read, ::read(request->socket(), request->mBuffer + request->mBufferLength, needed - 1)); // leave room for zero-termination
     if (!read) {
         return false; // socket was closed
     }
@@ -384,20 +389,21 @@ bool NW::processRequest(Request *request)
             switch (request->mState) {
             case Request::ParseRequestLine:
                 if (!::parseRequestLine(request->mBuffer, request->mMethod, request->mVersion, request->mPath)) {
-                    error("Parse error when parsing requestLine: [%s]\n",
-                          std::string(buf, crlf - buf).c_str());
+                    error("Parse error when parsing requestLine: [%s]\n", buf);
                     request->mState = Request::RequestError;
                     return false;
                 } else {
+                    request->mConnection = request->mVersion == Request::V1_1 ? Request::KeepAlive : Request::Close;
                     request->mState = Request::ParseHeaders;
-                    printf("Got Method %s => %d [%s]\n", std::string(buf, crlf - buf).c_str(), request->mMethod,
-                           request->mPath.c_str());
                     buf = crlf + 2;
                 }
                 break;
             case Request::ParseHeaders:
                 if (crlf == buf) {
                     request->mState = Request::ParseBody;
+                    const int rest = request->mBufferLength - (buf + 2 - request->mBuffer);
+                    ::memmove(request->mBuffer, buf + 2, rest);
+                    request->mBufferLength = rest;
                 } else {
                     const char *colon = strnchr(buf, ':', crlf - buf);
                     request->mHeaders.push_back(std::pair<std::string, std::string>());
@@ -443,21 +449,35 @@ bool NW::processRequest(Request *request)
         break; }
     case Request::ParseBody:
         if (request->mContentLength == -1) {
-            std::string val = request->headerValue("Content-Length");
-            char *end = 0;
-            const unsigned long contentLength = strtoull(val.c_str(), &end, 10);
-            if (*end) {
-                error("Parse error when parsing Content-Length: [%s]\n", val.c_str());
-                request->mState = Request::RequestError;
-                return false;
+            for (std::vector<std::pair<std::string, std::string> >::const_iterator it = request->mHeaders.begin(); it != request->mHeaders.end(); ++it) {
+                if (strcasecmp(it->first.c_str(), "Content-Length")) {
+                    char *end = 0;
+                    const unsigned long contentLength = strtoull(it->second.c_str(), &end, 10);
+                    if (*end) {
+                        error("Parse error when parsing Content-Length: [%s]\n", it->second.c_str());
+                        request->mState = Request::RequestError;
+                        return false;
+                    }
+                    request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
+                    if (request->mContentLength > maxContentLength()) {
+                        error("Request exceeds maximum content length %d/%d", request->mContentLength, maxContentLength());
+                        request->mState = Request::RequestError;
+                        return false;
+                    }
+                } else if (strcasecmp(it->first.c_str(), "Connection")) {
+                    if (strcasecmp(it->second.c_str(), "Keep-Alive")) {
+                        request->mConnection = Request::KeepAlive;
+                    } else if (strcasecmp(it->second.c_str(), "Close")) {
+                        request->mConnection = Request::Close;
+                    } else if (strcasecmp(it->second.c_str(), "Upgrade")) {
+                        request->mConnection = Request::Upgrade;
+                    } else {
+                        error("Unknown Connection value: %s", it->second.c_str());
+                        request->mState = Request::RequestError;
+                        return false;
+                    }
+                }
             }
-
-            request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
-        }
-        if (request->mContentLength > maxContentLength()) {
-            error("Request exceeds maximum content length %d/%d", request->mContentLength, maxContentLength());
-            request->mState = Request::RequestError;
-            return false;
         }
         // handleRequest(request);
         break;
