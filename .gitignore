@@ -11,4 +11,4 @@ cmake_install.cmake
 /.gdb_brestore.txt
 /compile_commands.json
 /examples/simple/simple
-/src/libnw.a
+/lib/libnw.a
