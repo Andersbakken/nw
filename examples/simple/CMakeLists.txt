@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 2.8)
+include_directories(${NW_INCLUDE})
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+add_executable(simple main.cpp)
+target_link_libraries(simple ${NW_LIBS})
