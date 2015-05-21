@@ -96,14 +96,14 @@ public:
 
         Version version() const { return mVersion; }
 
-        enum Connection {
+        enum ConnectionType {
             NoConnection,
             KeepAlive,
             Close,
             Upgrade
         };
 
-        Connection connection() const { return mConnection; }
+        ConnectionType connection() const { return mConnectionType; }
         int contentLength() const { return mContentLength; }
         int readContent(char *buf, int max);
     private:
@@ -114,7 +114,7 @@ public:
         Interface mLocalInterface, mRemoteInterface;
         Method mMethod;
         Version mVersion;
-        Connection mConnection;
+        ConnectionType mConnectionType;
         std::string mPath;
 
         std::vector<std::pair<std::string, std::string> > mHeaders;

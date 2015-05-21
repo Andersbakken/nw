@@ -374,7 +374,7 @@ bool NW::processRequest(Request *request)
     }
     request->mBufferLength += read;
     request->mBuffer[request->mBufferLength] = '\0';
-    
+
     switch (request->mState) {
     case Request::ParseRequestLine:
     case Request::ParseHeaders: {
@@ -393,7 +393,7 @@ bool NW::processRequest(Request *request)
                     request->mState = Request::RequestError;
                     return false;
                 } else {
-                    request->mConnection = request->mVersion == Request::V1_1 ? Request::KeepAlive : Request::Close;
+                    request->mConnectionType = request->mVersion == Request::V1_1 ? Request::KeepAlive : Request::Close;
                     request->mState = Request::ParseHeaders;
                     buf = crlf + 2;
                 }
@@ -466,11 +466,11 @@ bool NW::processRequest(Request *request)
                     }
                 } else if (strcasecmp(it->first.c_str(), "Connection")) {
                     if (strcasecmp(it->second.c_str(), "Keep-Alive")) {
-                        request->mConnection = Request::KeepAlive;
+                        request->mConnectionType = Request::KeepAlive;
                     } else if (strcasecmp(it->second.c_str(), "Close")) {
-                        request->mConnection = Request::Close;
+                        request->mConnectionType = Request::Close;
                     } else if (strcasecmp(it->second.c_str(), "Upgrade")) {
-                        request->mConnection = Request::Upgrade;
+                        request->mConnectionType = Request::Upgrade;
                     } else {
                         error("Unknown Connection value: %s", it->second.c_str());
                         request->mState = Request::RequestError;
@@ -568,7 +568,7 @@ void NW::error(const char *format, ...)
 
 NW::Request::Request(int socket, const NW::Interface &local, const NW::Interface &remote)
     : mSocket(socket), mLocalInterface(local), mRemoteInterface(remote),
-      mMethod(NoMethod), mVersion(NoVersion), mConnection(NoConnection),
+      mMethod(NoMethod), mVersion(NoVersion), mConnectionType(NoConnection),
       mState(ParseRequestLine), mContentLength(-1), mBuffer(0), mBufferLength(0),
       mBufferCapacity(0)
 {}
