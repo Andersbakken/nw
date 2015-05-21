@@ -1,0 +1,4 @@
+[submodule "3rdparty/wslay"]
+	path = 3rdparty/wslay
+	url = https://github.com/tatsuhiro-t/wslay.git
+	branch = master
