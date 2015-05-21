@@ -1,12 +1,14 @@
-/CMakeCache.txt
+CMakeCache.txt
 /.gdb_history
 /.ninja_deps
 /.ninja_log
-/CMakeFiles/*
+CMakeFiles
 /build.ninja
-/cmake_install.cmake
+cmake_install.cmake
 /nw
 /rules.ninja
 /.gdb_brestore
 /.gdb_brestore.txt
 /compile_commands.json
+/examples/simple/simple
+/src/libnw.a
