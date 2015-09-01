@@ -120,7 +120,7 @@ NW::Error NW::exec()
 
     NW::Error retVal = Success;
 
-    std::set<Request*> requests;
+    std::set<std::shared_ptr<Request> > requests;
     std::map<int, Interface> sockets;
     while (true) {
         {
@@ -193,7 +193,7 @@ NW::Error NW::exec()
             FD_SET(it->first, &r);
             max = std::max(max, it->first);
         }
-        for (std::set<Request*>::const_iterator it = requests.begin(); it != requests.end(); ++it) {
+        for (std::set<std::shared_ptr<Request> >::const_iterator it = requests.begin(); it != requests.end(); ++it) {
             const int fd = (*it)->socket();
             FD_SET(fd, &r);
             max = std::max(max, fd);
@@ -211,13 +211,13 @@ NW::Error NW::exec()
         for (std::map<int, Interface>::const_iterator it = sockets.begin(); count && it != sockets.end(); ++it) {
             if (FD_ISSET(it->first, &r)) {
                 --count;
-                Request *req = acceptConnection(it->first, it->second);
+                std::shared_ptr<Request> req = acceptConnection(it->first, it->second);
                 if (req) {
                     requests.insert(req);
                 }
             }
         }
-        std::set<Request*>::iterator it = requests.begin();
+        std::set<std::shared_ptr<Request> >::iterator it = requests.begin();
         while (count && it != requests.end()) {
             if (FD_ISSET((*it)->socket(), &r)) {
                 if (!processRequest(*it)) {
@@ -237,9 +237,8 @@ NW::Error NW::exec()
     for (std::map<int, Interface>::const_iterator it = sockets.begin(); it != sockets.end(); ++it) {
         ::close(it->first);
     }
-    for (std::set<Request*>::const_iterator it = requests.begin(); it != requests.end(); ++it) {
+    for (std::set<std::shared_ptr<Request> >::const_iterator it = requests.begin(); it != requests.end(); ++it) {
         ::close((*it)->socket());
-        delete *it;
     }
 
     return retVal;
@@ -354,7 +353,7 @@ static std::string trim(const char *start, int len)
     return std::string(start, len);
 }
 
-bool NW::processRequest(Request *request)
+bool NW::processRequest(const std::shared_ptr<Request> &request)
 {
     assert(request);
     int needed;
@@ -469,8 +468,6 @@ bool NW::processRequest(Request *request)
                         request->mConnectionType = Request::KeepAlive;
                     } else if (strcasecmp(it->second.c_str(), "Close")) {
                         request->mConnectionType = Request::Close;
-                    } else if (strcasecmp(it->second.c_str(), "Upgrade")) {
-                        request->mConnectionType = Request::Upgrade;
                     } else {
                         error("Unknown Connection value: %s", it->second.c_str());
                         request->mState = Request::RequestError;
@@ -479,7 +476,7 @@ bool NW::processRequest(Request *request)
                 }
             }
         }
-        // handleRequest(request);
+        handleRequest(request);
         break;
     case Request::RequestError:
         assert(0);
@@ -487,7 +484,7 @@ bool NW::processRequest(Request *request)
     }
 }
 
-NW::Request *NW::acceptConnection(int fd, const Interface &localInterface)
+std::shared_ptr<NW::Request> NW::acceptConnection(int fd, const Interface &localInterface)
 {
     sockaddr address;
     memset(&address, 0, sizeof(address));
@@ -498,7 +495,7 @@ NW::Request *NW::acceptConnection(int fd, const Interface &localInterface)
         char buf[128];
         snprintf(buf, sizeof(buf), "::accept failed %d", errno);
         log(Log_Error, buf);
-        return 0;
+        return std::shared_ptr<Request>();
     }
     sockaddr_in *sockin = reinterpret_cast<sockaddr_in*>(&address);
 
@@ -513,7 +510,7 @@ NW::Request *NW::acceptConnection(int fd, const Interface &localInterface)
     debug("::accepted connection on %s from %s (%d)",
           localInterface.toString().c_str(),
           remoteInterface.toString().c_str(), socket);
-    return new Request(socket, localInterface, remoteInterface);
+    return std::shared_ptr<Request>(new Request(socket, localInterface, remoteInterface));
 }
 
 void NW::log(LogType level, const char *format, va_list v)

@@ -6,10 +6,9 @@ public:
     Server()
     {}
 
-    virtual void handleRequest(Request *conn)
+    virtual void handleRequest(const std::shared_ptr<Request> &conn)
     {
-
-
+        printf("Got request %p\n", conn.get());
     }
     virtual void log(LogType level, const char *string)
     {

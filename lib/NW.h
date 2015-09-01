@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <memory>
 
 class NW
 {
@@ -69,6 +70,7 @@ public:
     class Request
     {
     public:
+        ~Request();
         int socket() const { return mSocket; }
         Interface localInterface() const { return mLocalInterface; }
         Interface remoteInterface() const { return mRemoteInterface; }
@@ -99,8 +101,7 @@ public:
         enum ConnectionType {
             NoConnection,
             KeepAlive,
-            Close,
-            Upgrade
+            Close
         };
 
         ConnectionType connection() const { return mConnectionType; }
@@ -108,7 +109,6 @@ public:
         int readContent(char *buf, int max);
     private:
         Request(int socket, const Interface &local, const Interface &remote);
-        ~Request();
 
         int mSocket;
         Interface mLocalInterface, mRemoteInterface;
@@ -132,7 +132,7 @@ public:
         friend class NW;
     };
 
-    virtual void handleRequest(Request *conn) = 0;
+    virtual void handleRequest(const std::shared_ptr<Request> &conn) = 0;
     enum LogType {
         Log_Debug,
         Log_Info,
@@ -150,9 +150,9 @@ private:
     void debug(const char *format, ...);
     void error(const char *format, ...);
 #endif
-    void parseHeaders(Request *conn, const char *buf, int len);
-    Request *acceptConnection(int fd, const Interface &localInterface);
-    bool processRequest(Request *connection);
+    void parseHeaders(const std::shared_ptr<Request> &conn, const char *buf, int len);
+    std::shared_ptr<Request> acceptConnection(int fd, const Interface &localInterface);
+    bool processRequest(const std::shared_ptr<Request> &request);
     void wakeup(char byte);
 
     bool mRunning;
