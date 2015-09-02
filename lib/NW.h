@@ -7,9 +7,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <memory>
+#include <map>
 
 class NW
 {
+    struct Connection;
 public:
     NW();
     virtual ~NW();
@@ -105,8 +107,7 @@ public:
         };
 
         ConnectionType connection() const { return mConnectionType; }
-        int contentLength() const { return mContentLength; }
-        int readContent(char *buf, int max);
+        std::string body() const { return mBody; }
     private:
         Request(int socket, const Interface &local, const Interface &remote);
 
@@ -118,16 +119,10 @@ public:
         std::string mPath;
 
         std::vector<std::pair<std::string, std::string> > mHeaders;
-        enum {
-            ParseRequestLine,
-            ParseHeaders,
-            ParseBody,
-            RequestError,
-        } mState;
         int mContentLength;
+        std::string mBody;
 
-        char *mBuffer;
-        int mBufferLength, mBufferCapacity;
+        friend struct Connection;
 
         friend class NW;
     };
@@ -151,9 +146,23 @@ private:
     void error(const char *format, ...);
 #endif
     void parseHeaders(const std::shared_ptr<Request> &conn, const char *buf, int len);
-    std::shared_ptr<Request> acceptConnection(int fd, const Interface &localInterface);
+    std::shared_ptr<Connection> acceptConnection(int fd, const Interface &localInterface);
     bool processRequest(const std::shared_ptr<Request> &request);
     void wakeup(char byte);
+
+    struct Connection
+    {
+        int fd;
+        Interface remoteInterface, localInterface;
+        enum {
+            ParseRequestLine,
+            ParseHeaders,
+            ParseBody,
+            RequestError,
+        } mState;
+        char *mBuffer;
+        int mBufferLength, mBufferCapacity;
+    };
 
     bool mRunning;
     mutable pthread_mutex_t mMutex;

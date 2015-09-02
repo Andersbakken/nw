@@ -121,6 +121,8 @@ NW::Error NW::exec()
     NW::Error retVal = Success;
 
     std::set<std::shared_ptr<Request> > requests;
+    std::map<int, std::shared_ptr<Connection> > connections;
+
     std::map<int, Interface> sockets;
     while (true) {
         {
@@ -211,12 +213,16 @@ NW::Error NW::exec()
         for (std::map<int, Interface>::const_iterator it = sockets.begin(); count && it != sockets.end(); ++it) {
             if (FD_ISSET(it->first, &r)) {
                 --count;
-                std::shared_ptr<Request> req = acceptConnection(it->first, it->second);
-                if (req) {
-                    requests.insert(req);
+                std::shared_ptr<Connection> conn = acceptConnection(it->first, it->second);
+                if (conn) {
+                    connections[conn->fd] = conn;
                 }
             }
         }
+        for (std::map<int, std::shared_ptr<Connection> >::const_iterator it = connections.begin(); it != connections.end(); ++it) {
+
+        }
+
         std::set<std::shared_ptr<Request> >::iterator it = requests.begin();
         while (count && it != requests.end()) {
             if (FD_ISSET((*it)->socket(), &r)) {
@@ -427,6 +433,16 @@ bool NW::processRequest(const std::shared_ptr<Request> &request)
                             }
 
                             request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
+                        } else if (!strcasecmp(h.first.c_str(), "Connection")) {
+                            if (!strcasecmp(h.second.c_str(), "Keep-Alive")) {
+                                request->mConnectionType = Request::KeepAlive;
+                            } else if (!strcasecmp(h.second.c_str(), "Close")) {
+                                request->mConnectionType = Request::Close;
+                            } else {
+                                error("Unknown Connection value: %s", h.second.c_str());
+                                request->mState = Request::RequestError;
+                                return false;
+                            }
                         }
                         ++colon;
                         eat(colon, Space);
@@ -447,35 +463,6 @@ bool NW::processRequest(const std::shared_ptr<Request> &request)
         }
         break; }
     case Request::ParseBody:
-        if (request->mContentLength == -1) {
-            for (std::vector<std::pair<std::string, std::string> >::const_iterator it = request->mHeaders.begin(); it != request->mHeaders.end(); ++it) {
-                if (strcasecmp(it->first.c_str(), "Content-Length")) {
-                    char *end = 0;
-                    const unsigned long contentLength = strtoull(it->second.c_str(), &end, 10);
-                    if (*end) {
-                        error("Parse error when parsing Content-Length: [%s]\n", it->second.c_str());
-                        request->mState = Request::RequestError;
-                        return false;
-                    }
-                    request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
-                    if (request->mContentLength > maxContentLength()) {
-                        error("Request exceeds maximum content length %d/%d", request->mContentLength, maxContentLength());
-                        request->mState = Request::RequestError;
-                        return false;
-                    }
-                } else if (strcasecmp(it->first.c_str(), "Connection")) {
-                    if (strcasecmp(it->second.c_str(), "Keep-Alive")) {
-                        request->mConnectionType = Request::KeepAlive;
-                    } else if (strcasecmp(it->second.c_str(), "Close")) {
-                        request->mConnectionType = Request::Close;
-                    } else {
-                        error("Unknown Connection value: %s", it->second.c_str());
-                        request->mState = Request::RequestError;
-                        return false;
-                    }
-                }
-            }
-        }
         handleRequest(request);
         break;
     case Request::RequestError:
