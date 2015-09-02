@@ -219,26 +219,20 @@ NW::Error NW::exec()
                 }
             }
         }
-        for (std::map<int, std::shared_ptr<Connection> >::const_iterator it = connections.begin(); it != connections.end(); ++it) {
-
-        }
-
-        std::set<std::shared_ptr<Request> >::iterator it = requests.begin();
-        while (count && it != requests.end()) {
-            if (FD_ISSET((*it)->socket(), &r)) {
-                if (!processRequest(*it)) {
+        std::map<int, std::shared_ptr<Connection> >::const_iterator it = connections.begin();
+        while (count && it != connections.end()) {
+            if (FD_ISSET(it->first, &r)) {
+                if (!processConnection(it->second)) {
                     int ret;
-                    EINTRWRAP(ret, ::close((*it)->socket()));
-                    requests.erase(it++);
+                    EINTRWRAP(ret, ::close(it->first));
+                    connections.erase(it++);
                 } else {
                     ++it;
                 }
                 --count;
-            } else {
-                ++it;
             }
-        }
 
+        }
     }
     for (std::map<int, Interface>::const_iterator it = sockets.begin(); it != sockets.end(); ++it) {
         ::close(it->first);
@@ -359,12 +353,12 @@ static std::string trim(const char *start, int len)
     return std::string(start, len);
 }
 
-bool NW::processRequest(const std::shared_ptr<Request> &request)
+bool NW::processConnection(const std::shared_ptr<Connection> &conn)
 {
-    assert(request);
+    assert(conn);
     int needed;
-    if (request->mContentLength != -1) {
-        needed = request->mContentLength - request->mBufferLength;
+    if (conn->request && conn->request->mContentLength != -1) {
+        needed = conn->request->mContentLength - conn->mBufferLength;
     } else {
         needed = 1025;
     }

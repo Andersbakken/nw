@@ -147,7 +147,7 @@ private:
 #endif
     void parseHeaders(const std::shared_ptr<Request> &conn, const char *buf, int len);
     std::shared_ptr<Connection> acceptConnection(int fd, const Interface &localInterface);
-    bool processRequest(const std::shared_ptr<Request> &request);
+    bool processConnection(const std::shared_ptr<Connection> &conn);
     void wakeup(char byte);
 
     struct Connection
@@ -159,9 +159,9 @@ private:
             ParseHeaders,
             ParseBody,
             RequestError,
-        } mState;
-        char *mBuffer;
-        int mBufferLength, mBufferCapacity;
+        } state;
+        char *buffer;
+        int bufferLength, bufferCapacity, contentLength;
     };
 
     bool mRunning;
