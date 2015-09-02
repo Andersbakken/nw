@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <memory>
 #include <map>
+#include <stdlib.h>
 
 class NW
 {
@@ -119,7 +120,6 @@ public:
         std::string mPath;
 
         std::vector<std::pair<std::string, std::string> > mHeaders;
-        int mContentLength;
         std::string mBody;
 
         friend struct Connection;
@@ -152,13 +152,24 @@ private:
 
     struct Connection
     {
-        int fd;
-        Interface remoteInterface, localInterface;
+        Connection(int sock, const Interface &local, const Interface &remote)
+            : socket(sock), localInterface(local), remoteInterface(remote),
+              state(ParseRequestLine), buffer(0), bufferLength(0), bufferCapacity(0),
+              contentLength(-1)
+        {}
+        ~Connection()
+        {
+            if (buffer)
+                free(buffer);
+        }
+        std::shared_ptr<Request> request;
+        int socket;
+        Interface localInterface, remoteInterface;
         enum {
             ParseRequestLine,
             ParseHeaders,
             ParseBody,
-            RequestError,
+            Error,
         } state;
         char *buffer;
         int bufferLength, bufferCapacity, contentLength;

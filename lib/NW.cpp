@@ -215,7 +215,7 @@ NW::Error NW::exec()
                 --count;
                 std::shared_ptr<Connection> conn = acceptConnection(it->first, it->second);
                 if (conn) {
-                    connections[conn->fd] = conn;
+                    connections[it->first] = conn;
                 }
             }
         }
@@ -357,61 +357,65 @@ bool NW::processConnection(const std::shared_ptr<Connection> &conn)
 {
     assert(conn);
     int needed;
-    if (conn->request && conn->request->mContentLength != -1) {
-        needed = conn->request->mContentLength - conn->mBufferLength;
+    if (conn->contentLength != -1) {
+        needed = conn->contentLength - conn->bufferLength;
     } else {
-        needed = 1025;
+        needed = 1024;
     }
-    if (request->mBufferCapacity - request->mBufferLength < needed) {
-        request->mBufferCapacity = needed - (request->mBufferCapacity - request->mBufferLength);
-        request->mBuffer = static_cast<char*>(::realloc(request->mBuffer, request->mBufferCapacity));
+    if (conn->bufferCapacity - conn->bufferLength < needed) {
+        conn->bufferCapacity = needed - (conn->bufferCapacity - conn->bufferLength);
+        conn->buffer = static_cast<char*>(::realloc(conn->buffer, conn->bufferCapacity + 1));
     }
     int read;
-    EINTRWRAP(read, ::read(request->socket(), request->mBuffer + request->mBufferLength, needed - 1)); // leave room for zero-termination
+    // should read directly into conn->request->mBody
+    EINTRWRAP(read, ::read(conn->socket, conn->buffer + conn->bufferLength, needed));
     if (!read) {
         return false; // socket was closed
     }
-    request->mBufferLength += read;
-    request->mBuffer[request->mBufferLength] = '\0';
+    conn->bufferLength += read;
+    conn->buffer[conn->bufferLength] = '\0';
 
-    switch (request->mState) {
-    case Request::ParseRequestLine:
-    case Request::ParseHeaders: {
-        char *buf = request->mBuffer;
-        while (request->mState != Request::ParseBody) {
+    switch (conn->state) {
+    case Connection::ParseRequestLine:
+    case Connection::ParseHeaders: {
+        char *buf = conn->buffer;
+        while (conn->state != Connection::ParseBody) {
             char *crlf = strstr(buf, "\r\n");
             if (crlf) {
                 *crlf = '\0';
             } else {
                 break;
             }
-            switch (request->mState) {
-            case Request::ParseRequestLine:
-                if (!::parseRequestLine(request->mBuffer, request->mMethod, request->mVersion, request->mPath)) {
+            switch (conn->state) {
+            case Connection::ParseRequestLine:
+                assert(!conn->request);
+                conn->request.reset(new Request(conn->socket, conn->localInterface, conn->remoteInterface));
+                if (!::parseRequestLine(conn->buffer, conn->request->mMethod, conn->request->mVersion, conn->request->mPath)) {
                     error("Parse error when parsing requestLine: [%s]\n", buf);
-                    request->mState = Request::RequestError;
+                    conn->state = Connection::Error;
                     return false;
                 } else {
-                    request->mConnectionType = request->mVersion == Request::V1_1 ? Request::KeepAlive : Request::Close;
-                    request->mState = Request::ParseHeaders;
+                    conn->request->mConnectionType = conn->request->mVersion == Request::V1_1 ? Request::KeepAlive : Request::Close;
+                    conn->state = Connection::ParseHeaders;
                     buf = crlf + 2;
                 }
                 break;
-            case Request::ParseHeaders:
+            case Connection::ParseHeaders:
                 if (crlf == buf) {
-                    request->mState = Request::ParseBody;
-                    const int rest = request->mBufferLength - (buf + 2 - request->mBuffer);
-                    ::memmove(request->mBuffer, buf + 2, rest);
-                    request->mBufferLength = rest;
+                    conn->state = Connection::ParseBody;
+                    const int rest = conn->bufferLength - (buf + 2 - conn->buffer);
+                    ::memmove(conn->buffer, buf + 2, rest);
+                    conn->bufferLength = rest;
                 } else {
+                    assert(conn->request);
                     const char *colon = strnchr(buf, ':', crlf - buf);
-                    request->mHeaders.push_back(std::pair<std::string, std::string>());
-                    std::pair<std::string, std::string> &h = request->mHeaders.back();
+                    conn->request->mHeaders.push_back(std::pair<std::string, std::string>());
+                    std::pair<std::string, std::string> &h = conn->request->mHeaders.back();
                     if (colon) {
                         if (colon == buf) {
                             error("Parse error when parsing header: [%s]\n",
                                   std::string(buf, crlf - buf).c_str());
-                            request->mState = Request::RequestError;
+                            conn->state = Connection::Error;
                             return false;
                         }
                         // ### need to chomp spaces
@@ -422,19 +426,19 @@ bool NW::processConnection(const std::shared_ptr<Connection> &conn)
                             if (*end) {
                                 error("Parse error when parsing Content-Length: [%s]\n",
                                       std::string(buf, crlf - buf).c_str());
-                                request->mState = Request::RequestError;
+                                conn->state = Connection::Error;
                                 return false;
                             }
 
-                            request->mContentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
+                            conn->contentLength = std::min<unsigned long>(INT_MAX, contentLength); // ### probably lower cap
                         } else if (!strcasecmp(h.first.c_str(), "Connection")) {
                             if (!strcasecmp(h.second.c_str(), "Keep-Alive")) {
-                                request->mConnectionType = Request::KeepAlive;
+                                conn->request->mConnectionType = Request::KeepAlive;
                             } else if (!strcasecmp(h.second.c_str(), "Close")) {
-                                request->mConnectionType = Request::Close;
+                                conn->request->mConnectionType = Request::Close;
                             } else {
                                 error("Unknown Connection value: %s", h.second.c_str());
-                                request->mState = Request::RequestError;
+                                conn->state = Connection::Error;
                                 return false;
                             }
                         }
@@ -449,23 +453,28 @@ bool NW::processConnection(const std::shared_ptr<Connection> &conn)
                     buf = crlf + 2;
                 }
                 break;
-            case Request::ParseBody:
-            case Request::RequestError:
+            case Connection::ParseBody:
+            case Connection::Error:
                 assert(0);
                 break;
             }
         }
         break; }
-    case Request::ParseBody:
-        handleRequest(request);
+    case Connection::ParseBody:
+        assert(conn->request);
+        if (conn->request->mMethod == Request::Post && conn->contentLength > 0) {
+
+        }
+        handleRequest(conn->request);
         break;
-    case Request::RequestError:
+    case Connection::Error:
         assert(0);
         break;
     }
+    return true;
 }
 
-std::shared_ptr<NW::Request> NW::acceptConnection(int fd, const Interface &localInterface)
+std::shared_ptr<NW::Connection> NW::acceptConnection(int fd, const Interface &localInterface)
 {
     sockaddr address;
     memset(&address, 0, sizeof(address));
@@ -476,7 +485,7 @@ std::shared_ptr<NW::Request> NW::acceptConnection(int fd, const Interface &local
         char buf[128];
         snprintf(buf, sizeof(buf), "::accept failed %d", errno);
         log(Log_Error, buf);
-        return std::shared_ptr<Request>();
+        return std::shared_ptr<Connection>();
     }
     sockaddr_in *sockin = reinterpret_cast<sockaddr_in*>(&address);
 
@@ -491,7 +500,7 @@ std::shared_ptr<NW::Request> NW::acceptConnection(int fd, const Interface &local
     debug("::accepted connection on %s from %s (%d)",
           localInterface.toString().c_str(),
           remoteInterface.toString().c_str(), socket);
-    return std::shared_ptr<Request>(new Request(socket, localInterface, remoteInterface));
+    return std::shared_ptr<Connection>(new Connection(socket, localInterface, remoteInterface));
 }
 
 void NW::log(LogType level, const char *format, va_list v)
@@ -546,15 +555,11 @@ void NW::error(const char *format, ...)
 
 NW::Request::Request(int socket, const NW::Interface &local, const NW::Interface &remote)
     : mSocket(socket), mLocalInterface(local), mRemoteInterface(remote),
-      mMethod(NoMethod), mVersion(NoVersion), mConnectionType(NoConnection),
-      mState(ParseRequestLine), mContentLength(-1), mBuffer(0), mBufferLength(0),
-      mBufferCapacity(0)
+      mMethod(NoMethod), mVersion(NoVersion), mConnectionType(NoConnection)
 {}
 
 NW::Request::~Request()
 {
-    if (mBuffer)
-        ::free(mBuffer);
 }
 
 
@@ -580,6 +585,7 @@ std::string NW::Request::headerValue(const std::string &header) const
     return std::string();
 }
 
+#if 0
 int NW::Request::readContent(char *buf, int max)
 {
     assert(buf); // ### should one be able to discard data?
@@ -604,4 +610,5 @@ int NW::Request::readContent(char *buf, int max)
     }
     return ret;
 }
+#endif
 
